@@ -839,7 +839,12 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
         }
     }
     
+    open var forceOrientation: AVCaptureVideoOrientation?
     fileprivate func _currentVideoOrientation() -> AVCaptureVideoOrientation {
+        if let forceOrientation = forceOrientation {
+            return forceOrientation
+        }
+        
         switch UIDevice.current.orientation {
         case .landscapeLeft:
             return .landscapeRight
