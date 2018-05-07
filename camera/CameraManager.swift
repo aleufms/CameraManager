@@ -13,6 +13,7 @@ import ImageIO
 import MobileCoreServices
 import Photos
 import CoreLocation
+import CoreMotion
 
 public enum CameraState {
     case ready, accessDenied, noDeviceFound, notDetermined
@@ -228,6 +229,11 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
         return tempURL
     }
     
+    fileprivate var coreMotionManager: CMMotionManager!
+    
+    /// Real device orientation from accelerometer
+    fileprivate var deviceOrientation: UIDeviceOrientation = .portrait
+    
     
     // MARK: - CameraManager
     
@@ -310,8 +316,10 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
     open func resumeCaptureSession() {
         if let validCaptureSession = captureSession {
             if !validCaptureSession.isRunning && cameraIsSetup {
-                validCaptureSession.startRunning()
-                _startFollowingDeviceOrientation()
+                self.sessionQueue.async(execute: {
+                    validCaptureSession.startRunning()
+                    self._startFollowingDeviceOrientation()
+                })
             }
         } else {
             if _canLoadCamera() {
@@ -332,19 +340,21 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
      Stops running capture session and removes all setup devices, inputs and outputs.
      */
     open func stopAndRemoveCaptureSession() {
-        stopCaptureSession()
-        let oldAnimationValue = animateCameraDeviceChange
-        animateCameraDeviceChange = false
-        cameraDevice = .back
-        cameraIsSetup = false
-        previewLayer = nil
-        captureSession = nil
-        frontCameraDevice = nil
-        backCameraDevice = nil
-        mic = nil
-        stillImageOutput = nil
-        movieOutput = nil
-        animateCameraDeviceChange = oldAnimationValue
+        sessionQueue.async(execute: {
+            self.stopCaptureSession()
+            let oldAnimationValue = self.animateCameraDeviceChange
+            self.animateCameraDeviceChange = false
+            self.cameraDevice = .back
+            self.cameraIsSetup = false
+            self.previewLayer = nil
+            self.captureSession = nil
+            self.frontCameraDevice = nil
+            self.backCameraDevice = nil
+            self.mic = nil
+            self.stillImageOutput = nil
+            self.movieOutput = nil
+            self.animateCameraDeviceChange = oldAnimationValue
+        })
     }
     
     /**
@@ -377,7 +387,24 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
         }
         
         let image: UIImage
-        if self.shouldFlipFrontCameraImage == true, self.cameraDevice == .front {
+        if UIDevice.current.userInterfaceIdiom == .pad, self.cameraDevice == .front {
+            guard let cgImage = tempImage.cgImage else {
+                imageCompletion(nil, NSError())
+                return
+            }
+            
+            switch _currentVideoOrientation() {
+            case .landscapeLeft:
+                image = UIImage(cgImage: cgImage, scale: tempImage.scale, orientation: self.shouldFlipFrontCameraImage ? .upMirrored : .up)
+            case .landscapeRight:
+                image = UIImage(cgImage: cgImage, scale: tempImage.scale, orientation: self.shouldFlipFrontCameraImage ? .downMirrored : .down)
+            case .portraitUpsideDown:
+                image = UIImage(cgImage: cgImage, scale: tempImage.scale, orientation: self.shouldFlipFrontCameraImage ? .rightMirrored : .left)
+            default:
+                image = UIImage(cgImage: cgImage, scale: tempImage.scale, orientation: self.shouldFlipFrontCameraImage ? .leftMirrored : .right)
+            }
+        }
+        else if self.shouldFlipFrontCameraImage == true, self.cameraDevice == .front {
             guard let cgImage = tempImage.cgImage else {
                 imageCompletion(nil, NSError())
                 return
@@ -385,7 +412,20 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
             let flippedImage = UIImage(cgImage: cgImage, scale: tempImage.scale, orientation: .leftMirrored)
             image = flippedImage
         } else {
-            image = tempImage
+            guard let cgImage = tempImage.cgImage else {
+                imageCompletion(nil, NSError())
+                return
+            }
+            switch _currentVideoOrientation() {
+            case .landscapeLeft:
+                image = UIImage(cgImage: cgImage, scale: 2, orientation: .up)
+            case .landscapeRight:
+                image = UIImage(cgImage: cgImage, scale: 2, orientation: .down)
+            case .portraitUpsideDown:
+                image = UIImage(cgImage: cgImage, scale: 2, orientation: .left)
+            default:
+                image = UIImage(cgImage: cgImage, scale: 2, orientation: .right)
+            }
         }
         
         if self.writeFilesToPhoneLibrary == true, let library = self.library  {
@@ -427,20 +467,25 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
         
         sessionQueue.async(execute: {
             let stillImageOutput = self._getStillImageOutput()
-            stillImageOutput.captureStillImageAsynchronously(from: stillImageOutput.connection(with: AVMediaType.video)!, completionHandler: { [weak self] sample, error in
-                
-                if let error = error {
-                    DispatchQueue.main.async(execute: {
-                        self?._show(NSLocalizedString("Error", comment:""), message: error.localizedDescription)
-                    })
-                    imageCompletion(nil, error as NSError?)
-                    return
-                }
-                
-                let imageData = AVCaptureStillImageOutput.jpegStillImageNSDataRepresentation(sample!)
-                imageCompletion(imageData, nil)
-                
-            })
+            if let connection = stillImageOutput.connection(with: AVMediaType.video),
+                connection.isEnabled {
+                stillImageOutput.captureStillImageAsynchronously(from: connection, completionHandler: { [weak self] sample, error in
+                    
+                    if let error = error {
+                        DispatchQueue.main.async(execute: {
+                            self?._show(NSLocalizedString("Error", comment:""), message: error.localizedDescription)
+                        })
+                        imageCompletion(nil, error as NSError?)
+                        return
+                    }
+                    
+                    let imageData = AVCaptureStillImageOutput.jpegStillImageNSDataRepresentation(sample!)
+                    imageCompletion(imageData, nil)
+                    
+                })
+            } else {
+                imageCompletion(nil, NSError())
+            }
         })
         
     }
@@ -774,21 +819,20 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
     }
     
     fileprivate func _getMovieOutput() -> AVCaptureMovieFileOutput {
-        if let movieOutput = movieOutput, let connection = movieOutput.connection(with: AVMediaType.video),
-            connection.isActive {
-            return movieOutput
-        }
-        let newMoviewOutput = AVCaptureMovieFileOutput()
-        newMoviewOutput.movieFragmentInterval = kCMTimeInvalid
-        movieOutput = newMoviewOutput
-        if let captureSession = captureSession {
-            if captureSession.canAddOutput(newMoviewOutput) {
-                captureSession.beginConfiguration()
-                captureSession.addOutput(newMoviewOutput)
-                captureSession.commitConfiguration()
+        if (movieOutput == nil) {
+            let newMoviewOutput = AVCaptureMovieFileOutput()
+            newMoviewOutput.movieFragmentInterval = kCMTimeInvalid
+            movieOutput = newMoviewOutput
+            if let captureSession = captureSession {
+                if captureSession.canAddOutput(newMoviewOutput) {
+                    captureSession.beginConfiguration()
+                    captureSession.addOutput(newMoviewOutput)
+                    captureSession.commitConfiguration()
+                }
             }
         }
-        return newMoviewOutput
+
+        return movieOutput!
     }
     
     fileprivate func _getStillImageOutput() -> AVCaptureStillImageOutput {
@@ -809,7 +853,8 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
     }
     
     @objc fileprivate func _orientationChanged() {
-        var currentConnection: AVCaptureConnection?;
+        var currentConnection: AVCaptureConnection?
+
         switch cameraOutputMode {
         case .stillImage:
             currentConnection = stillImageOutput?.connection(with: AVMediaType.video)
@@ -845,11 +890,13 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
             return forceOrientation
         }
         
-        switch UIDevice.current.orientation {
+        switch deviceOrientation {
         case .landscapeLeft:
             return .landscapeRight
         case .landscapeRight:
             return .landscapeLeft
+        case .portraitUpsideDown:
+            return .portraitUpsideDown
         default:
             return .portrait
         }
@@ -886,14 +933,33 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
     
     fileprivate func _startFollowingDeviceOrientation() {
         if shouldRespondToOrientationChanges && !cameraIsObservingDeviceOrientation {
-            NotificationCenter.default.addObserver(self, selector: #selector(CameraManager._orientationChanged), name: NSNotification.Name.UIDeviceOrientationDidChange, object: nil)
-            cameraIsObservingDeviceOrientation = true
+            coreMotionManager = CMMotionManager()
+            coreMotionManager.accelerometerUpdateInterval = 0.1
+            
+            if coreMotionManager.isAccelerometerAvailable {
+                coreMotionManager.startAccelerometerUpdates(to: OperationQueue(), withHandler:
+                    {data, error in
+                        
+                        guard let data = data else{
+                            return
+                        }
+                        abs( data.acceleration.y ) < abs( data.acceleration.x )
+                            ?   data.acceleration.x > 0 ? (self.deviceOrientation = UIDeviceOrientation.landscapeRight)  :  (self.deviceOrientation = UIDeviceOrientation.landscapeLeft)
+                            :   data.acceleration.y > 0 ? (self.deviceOrientation = UIDeviceOrientation.portraitUpsideDown)   :   (self.deviceOrientation = UIDeviceOrientation.portrait)
+                        self._orientationChanged()
+                })
+                
+                cameraIsObservingDeviceOrientation = true
+            }
+            else {
+                cameraIsObservingDeviceOrientation = false
+            }
         }
     }
     
     fileprivate func _stopFollowingDeviceOrientation() {
         if cameraIsObservingDeviceOrientation {
-            NotificationCenter.default.removeObserver(self, name: NSNotification.Name.UIDeviceOrientationDidChange, object: nil)
+            coreMotionManager.stopAccelerometerUpdates()
             cameraIsObservingDeviceOrientation = false
         }
     }
@@ -1182,7 +1248,7 @@ open class CameraManager: NSObject, AVCaptureFileOutputRecordingDelegate, UIGest
             let inputs: [AVCaptureInput] = validCaptureSession.inputs
             
             for input in inputs {
-                if let deviceInput = input as? AVCaptureDeviceInput {
+                if let deviceInput = input as? AVCaptureDeviceInput, deviceInput.device != mic {
                     validCaptureSession.removeInput(deviceInput)
                 }
             }
